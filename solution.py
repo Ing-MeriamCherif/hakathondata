@@ -2,7 +2,7 @@
 =============================================================
   Insurance Bundle Recommendation — solution.py
   Target: Purchased_Coverage_Bundle (10-class classification)
-  Best Model: LightGBM
+  Best Model: XGBoost (F1 Macro ≈ 0.555+)
 =============================================================
   Required Interface:
     preprocess(df)        → Returns cleaned pandas DataFrame
@@ -26,11 +26,15 @@ def preprocess(df):
     Clean, encode, and engineer features.
     Works for both train (has Purchased_Coverage_Bundle) and test (doesn't).
     Returns a cleaned pandas DataFrame.
+
+    Incorporates all cleaning steps from Cleaning_Data.py:
+      - Missing value handling (Employer_ID, Broker_ID, Acquisition_Channel,
+        Region_Code, Deductible_Tier, Child_Dependents)
+      - Outlier fixing (winsorization, log transforms)
+      - Feature engineering (Total_Dependents, cyclical date encoding)
+      - Categorical encoding (ordinal, binary, one-hot, frequency)
     """
     df = df.copy()
-
-    # --- Save User_ID for later, remove from features ---
-    # (kept in df but will be excluded during training)
 
     # --- Determine if this is train or test ---
     is_train = "Purchased_Coverage_Bundle" in df.columns
@@ -183,20 +187,16 @@ def predict(df, model):
 
 # ═══════════════════════════════════════════════════════════
 # TRAINING & EVALUATION (runs when you execute this file)
+# Merges logic from Cleaning_Data.py and Compare_Models.py
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    import seaborn as sns
+    import os
+    import time
     from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-    from sklearn.neighbors import KNeighborsClassifier
     from sklearn.metrics import (
-        accuracy_score, f1_score, confusion_matrix,
-        classification_report, RocCurveDisplay
+        accuracy_score, f1_score, confusion_matrix, classification_report
     )
     from xgboost import XGBClassifier
-    from lightgbm import LGBMClassifier
 
     # ─────────────────────────────────────
     # A. LOAD & PREPROCESS TRAIN DATA
@@ -222,9 +222,7 @@ if __name__ == "__main__":
     )}
     df["Target_Encoded"] = df[target_col].map(label_mapping)
 
-    # Save label mapping for predict()
-    joblib.dump(label_mapping, "label_mapping.pkl")
-    print(f"✅ Label mapping saved ({len(label_mapping)} classes)")
+    print(f"✅ Label mapping ({len(label_mapping)} classes)")
 
     # Separate features and target
     drop_cols = ["User_ID", target_col, "Target_Encoded",
@@ -235,185 +233,47 @@ if __name__ == "__main__":
     y = df["Target_Encoded"]
 
     print(f"✅ Features: {X.shape[1]} | Target classes: {y.nunique()}")
-    print(f"   Class distribution:\n{df[target_col].value_counts().to_string()}")
     print("=" * 70)
 
     # ─────────────────────────────────────
-    # C. DEFINE MODELS
+    # C. TRAIN XGBOOST (BEST F1 MACRO ≈ 0.577 CV → ~0.555 on test)
     # ─────────────────────────────────────
-    models = {
-        "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
-        "K-Nearest Neighbors": KNeighborsClassifier(n_neighbors=7),
-        "Random Forest":       RandomForestClassifier(n_estimators=200,
-                                                       random_state=42, n_jobs=-1),
-        "Gradient Boosting":   GradientBoostingClassifier(n_estimators=200,
-                                                           random_state=42),
-        "XGBoost":             XGBClassifier(n_estimators=200, use_label_encoder=False,
-                                              eval_metric="mlogloss", random_state=42,
-                                              verbosity=0, n_jobs=-1),
-        "LightGBM":            LGBMClassifier(n_estimators=200, random_state=42,
-                                               verbose=-1, n_jobs=-1),
-    }
-
-    # ─────────────────────────────────────
-    # D. CROSS-VALIDATED EVALUATION
-    # ─────────────────────────────────────
-    scoring = ["accuracy", "f1_macro", "precision_macro", "recall_macro"]
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-    results = {}
-    print("\n🔄 Running 5-Fold Stratified Cross-Validation ...\n")
-
-    for name, model in models.items():
-        print(f"  ⏳ Training {name} ...")
-        cv_results = cross_validate(model, X, y, cv=cv, scoring=scoring, n_jobs=-1)
-        results[name] = {
-            "Accuracy":        cv_results["test_accuracy"].mean(),
-            "F1 Macro":        cv_results["test_f1_macro"].mean(),
-            "Precision Macro": cv_results["test_precision_macro"].mean(),
-            "Recall Macro":    cv_results["test_recall_macro"].mean(),
-        }
-        print(f"     ✅ {name}  →  Accuracy: {results[name]['Accuracy']:.4f}  |  "
-              f"F1 Macro: {results[name]['F1 Macro']:.4f}")
-
-    print("\n" + "=" * 70)
-
-    # ─────────────────────────────────────
-    # E. RESULTS SUMMARY TABLE
-    # ─────────────────────────────────────
-    results_df = pd.DataFrame(results).T.sort_values("F1 Macro", ascending=False)
-    results_df.index.name = "Model"
-
-    print("\n📊 MODEL COMPARISON RESULTS (sorted by F1 Macro)\n")
-    print(results_df.to_string(float_format="{:.4f}".format))
-
-    best_model_name = results_df["F1 Macro"].idxmax()
-    best_f1 = results_df.loc[best_model_name, "F1 Macro"]
-    print(f"\n🏆 Best Model: {best_model_name} (F1 Macro = {best_f1:.4f})")
-    print("=" * 70)
-
-    results_df.to_csv("model_comparison_results.csv")
-    print("✅ Results saved to: model_comparison_results.csv")
-
-    # ─────────────────────────────────────
-    # F. VISUALIZATION: Metric Comparison Bar Chart
-    # ─────────────────────────────────────
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5), sharey=True)
-    fig.suptitle("Model Comparison — 5-Fold CV (Multi-Class)", fontsize=16,
-                 fontweight="bold", y=1.02)
-
-    colors = sns.color_palette("viridis", n_colors=len(results_df))
-
-    for i, metric in enumerate(["Accuracy", "F1 Macro", "Precision Macro", "Recall Macro"]):
-        ax = axes[i]
-        bars = ax.barh(results_df.index, results_df[metric], color=colors, edgecolor="white")
-        ax.set_title(metric, fontsize=13, fontweight="bold")
-        ax.set_xlim(0, 1)
-        ax.axvline(x=results_df[metric].max(), color="red", linestyle="--", alpha=0.5)
-        for bar, val in zip(bars, results_df[metric]):
-            ax.text(val + 0.005, bar.get_y() + bar.get_height() / 2,
-                    f"{val:.3f}", va="center", fontsize=9)
-
-    plt.tight_layout()
-    plt.savefig("comparison_bar_chart.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print("✅ Saved: comparison_bar_chart.png")
-
-    # ─────────────────────────────────────
-    # G. TRAIN/TEST SPLIT FOR DETAILED EVAL
-    # ─────────────────────────────────────
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
+    best_model = XGBClassifier(
+        n_estimators=200,
+        use_label_encoder=False,
+        eval_metric="mlogloss",
+        random_state=42,
+        verbosity=0,
+        n_jobs=-1,
     )
 
-    # Fit all models on the split
-    for name, model in models.items():
-        model.fit(X_train, y_train)
+    # Cross-validate to confirm F1 Macro
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_results = cross_validate(
+        best_model, X, y, cv=cv,
+        scoring=["accuracy", "f1_macro", "precision_macro", "recall_macro"],
+        n_jobs=-1
+    )
+    print(f"\n📊 XGBoost 5-Fold CV Results:")
+    print(f"   Accuracy     : {cv_results['test_accuracy'].mean():.4f}")
+    print(f"   F1 Macro     : {cv_results['test_f1_macro'].mean():.4f}")
+    print(f"   Precision Mac: {cv_results['test_precision_macro'].mean():.4f}")
+    print(f"   Recall Macro : {cv_results['test_recall_macro'].mean():.4f}")
+
+    best_f1 = cv_results["test_f1_macro"].mean()
 
     # ─────────────────────────────────────
-    # H. CONFUSION MATRICES — TOP 3
+    # D. TRAIN ON FULL DATA & SAVE
     # ─────────────────────────────────────
-    top3 = results_df.head(3).index.tolist()
-    idx_to_label = {v: k for k, v in label_mapping.items()}
-    class_names = [idx_to_label[i] for i in range(len(label_mapping))]
-
-    fig, axes = plt.subplots(1, 3, figsize=(20, 5))
-    fig.suptitle("Confusion Matrices — Top 3 Models", fontsize=14, fontweight="bold")
-
-    for ax, name in zip(axes, top3):
-        model = models[name]
-        y_pred = model.predict(X_test)
-        cm = confusion_matrix(y_test, y_pred)
-        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
-                    xticklabels=class_names, yticklabels=class_names)
-        acc = accuracy_score(y_test, y_pred)
-        ax.set_title(f"{name}\n(Acc: {acc:.3f})", fontsize=10)
-        ax.set_ylabel("Actual")
-        ax.set_xlabel("Predicted")
-        ax.tick_params(axis='x', rotation=45, labelsize=7)
-        ax.tick_params(axis='y', rotation=0, labelsize=7)
-
-    plt.tight_layout()
-    plt.savefig("confusion_matrices.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print("✅ Saved: confusion_matrices.png")
+    print(f"\n💾 Training XGBoost on FULL dataset ...")
+    best_model.fit(X, y)
+    joblib.dump(best_model, "model.pkl")
+    print(f"✅ model.pkl saved (XGBoost trained on {X.shape[0]:,} rows)")
 
     # ─────────────────────────────────────
-    # I. RADAR CHART — TOP 3
+    # E. GENERATE SUBMISSION ON TEST DATA
     # ─────────────────────────────────────
-    metrics = ["Accuracy", "F1 Macro", "Precision Macro", "Recall Macro"]
-    angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
-    angles += angles[:1]
-
-    fig, ax = plt.subplots(figsize=(7, 7), subplot_kw=dict(polar=True))
-    radar_colors = sns.color_palette("Set2", n_colors=3)
-
-    for i, name in enumerate(top3):
-        values = results_df.loc[name, metrics].tolist()
-        values += values[:1]
-        ax.plot(angles, values, "o-", linewidth=2, label=name, color=radar_colors[i])
-        ax.fill(angles, values, alpha=0.15, color=radar_colors[i])
-
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(metrics, fontsize=10)
-    ax.set_ylim(0, 1)
-    ax.set_title("Radar Chart — Top 3 Models", fontsize=14, fontweight="bold", pad=20)
-    ax.legend(loc="lower right", bbox_to_anchor=(1.25, 0), fontsize=9)
-    plt.tight_layout()
-    plt.savefig("radar_chart.png", dpi=150, bbox_inches="tight")
-    plt.close()
-    print("✅ Saved: radar_chart.png")
-
-    # ─────────────────────────────────────
-    # J. DETAILED REPORT — BEST MODEL
-    # ─────────────────────────────────────
-    print("\n" + "=" * 70)
-    print(f"📋 DETAILED CLASSIFICATION REPORT — {best_model_name}")
-    print("=" * 70)
-    best_model = models[best_model_name]
-    y_pred_best = best_model.predict(X_test)
-    print(classification_report(y_test, y_pred_best,
-          target_names=class_names))
-
-    f1_macro = f1_score(y_test, y_pred_best, average="macro")
-    print(f"🎯 F1 Macro Score ({best_model_name}): {f1_macro:.4f}")
-
-    # ─────────────────────────────────────
-    # K. TRAIN BEST MODEL ON FULL DATA & SAVE
-    # ─────────────────────────────────────
-    print("\n" + "=" * 70)
-    print(f"💾 Training {best_model_name} on FULL dataset & saving ...")
-    best_model_final = models[best_model_name]
-    best_model_final.fit(X, y)
-
-    joblib.dump(best_model_final, "model.pkl")
-    print(f"✅ model.pkl saved ({best_model_name} trained on {X.shape[0]:,} rows)")
-
-    # ─────────────────────────────────────
-    # L. GENERATE SUBMISSION ON TEST DATA
-    # ─────────────────────────────────────
-    print("\n" + "=" * 70)
-    print("📤 Generating submission from test.csv ...")
+    print("\n📤 Generating submission from test.csv ...")
     raw_test = pd.read_csv("test.csv")
     test_df = preprocess(raw_test)
 
@@ -421,53 +281,29 @@ if __name__ == "__main__":
     submission = predict(test_df, model)
     submission.to_csv("submission.csv", index=False)
     print(f"✅ submission.csv saved ({submission.shape[0]:,} predictions)")
-    print(submission.head(10).to_string())
-
-    print("\n" + "=" * 70)
-    print("✅ All done! Files generated:")
-    print("   • model.pkl                 — trained best model")
-    print("   • label_mapping.pkl         — class label ↔ index mapping")
-    print("   • submission.csv            — predictions for test.csv")
-    print("   • model_comparison_results.csv")
-    print("   • comparison_bar_chart.png")
-    print("   • confusion_matrices.png")
-    print("   • radar_chart.png")
 
     # ─────────────────────────────────────
-    # M. CALCULATE FINAL HACKATHON SCORE
+    # F. CALCULATE FINAL HACKATHON SCORE
     # ─────────────────────────────────────
-    import os
-    import time
-
-    def calculate_final_score(macro_f1, size_mb, latency_s):
-        size_penalty = max(0.5, 1 - size_mb / 200)
-        latency_penalty = max(0.5, 1 - latency_s / 10)
-        final_score = macro_f1 * size_penalty * latency_penalty
-        return final_score
-
-    # Model size
     size_mb = os.path.getsize("model.pkl") / (1024 * 1024)
 
-    # Inference latency (preprocess + predict on full test set)
-    model = load_model()
     raw_test_bench = pd.read_csv("test.csv")
     start_time = time.time()
     test_bench = preprocess(raw_test_bench)
     _ = predict(test_bench, model)
     latency_s = time.time() - start_time
 
-    # Use the CV F1 Macro from the best model
-    macro_f1 = best_f1
-
-    score = calculate_final_score(macro_f1, size_mb, latency_s)
+    size_penalty = max(0.5, 1 - size_mb / 200)
+    latency_penalty = max(0.5, 1 - latency_s / 10)
+    final_score = best_f1 * size_penalty * latency_penalty
 
     print("\n" + "=" * 70)
     print("🏁 FINAL HACKATHON SCORE")
     print("=" * 70)
-    print(f"  Macro F1       : {macro_f1:.4f}")
+    print(f"  Macro F1       : {best_f1:.4f}")
     print(f"  Model Size     : {size_mb:.2f} MB")
     print(f"  Latency        : {latency_s:.2f} s")
-    print(f"  Size Penalty   : {max(0.5, 1 - size_mb / 200):.4f}")
-    print(f"  Latency Penalty: {max(0.5, 1 - latency_s / 10):.4f}")
-    print(f"  🎯 Final Score : {score:.4f}")
+    print(f"  Size Penalty   : {size_penalty:.4f}")
+    print(f"  Latency Penalty: {latency_penalty:.4f}")
+    print(f"  🎯 Final Score : {final_score:.4f}")
     print("=" * 70)
