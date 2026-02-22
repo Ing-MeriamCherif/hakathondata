@@ -432,4 +432,42 @@ if __name__ == "__main__":
     print("   • comparison_bar_chart.png")
     print("   • confusion_matrices.png")
     print("   • radar_chart.png")
+
+    # ─────────────────────────────────────
+    # M. CALCULATE FINAL HACKATHON SCORE
+    # ─────────────────────────────────────
+    import os
+    import time
+
+    def calculate_final_score(macro_f1, size_mb, latency_s):
+        size_penalty = max(0.5, 1 - size_mb / 200)
+        latency_penalty = max(0.5, 1 - latency_s / 10)
+        final_score = macro_f1 * size_penalty * latency_penalty
+        return final_score
+
+    # Model size
+    size_mb = os.path.getsize("model.pkl") / (1024 * 1024)
+
+    # Inference latency (preprocess + predict on full test set)
+    model = load_model()
+    raw_test_bench = pd.read_csv("test.csv")
+    start_time = time.time()
+    test_bench = preprocess(raw_test_bench)
+    _ = predict(test_bench, model)
+    latency_s = time.time() - start_time
+
+    # Use the CV F1 Macro from the best model
+    macro_f1 = best_f1
+
+    score = calculate_final_score(macro_f1, size_mb, latency_s)
+
+    print("\n" + "=" * 70)
+    print("🏁 FINAL HACKATHON SCORE")
+    print("=" * 70)
+    print(f"  Macro F1       : {macro_f1:.4f}")
+    print(f"  Model Size     : {size_mb:.2f} MB")
+    print(f"  Latency        : {latency_s:.2f} s")
+    print(f"  Size Penalty   : {max(0.5, 1 - size_mb / 200):.4f}")
+    print(f"  Latency Penalty: {max(0.5, 1 - latency_s / 10):.4f}")
+    print(f"  🎯 Final Score : {score:.4f}")
     print("=" * 70)
