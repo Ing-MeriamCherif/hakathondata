@@ -1,3 +1,2 @@
-# All required packages are pre-installed in the judge environment:
-# numpy, scipy, pandas, scikit-learn, lightgbm, xgboost, joblib
+# All required packages are pre-installed in the judge environment.
 # No additional dependencies needed.
