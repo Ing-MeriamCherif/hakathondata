@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import joblib
+import os
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -15,22 +16,38 @@ LABEL_TO_INT = {
     "Renter_Basic": 8, "Renter_Premium": 9,
 }
 
-MONTH_ORDER = {
+MONTH_MAP = {
     "January": 1, "February": 2, "March": 3, "April": 4,
     "May": 5, "June": 6, "July": 7, "August": 8,
     "September": 9, "October": 10, "November": 11, "December": 12,
 }
 
-DEDUCTIBLE_ORDER = {
+DEDUCTIBLE_MAP = {
     "Tier_1_High_Ded": 1, "Tier_2_Mid_Ded": 2,
     "Tier_3_Low_Ded": 3, "Tier_4_Zero_Ded": 4,
 }
 
+# Correct one-hot categories (from actual data, drop_first style)
 OHE_SPECS = {
-    "Acquisition_Channel": ["Broker_Referral", "Direct_Online", "Employer_Group", "Third_Party_Aggregator"],
-    "Payment_Schedule": ["Monthly", "Quarterly", "Semi_Annual"],
-    "Employment_Status": ["Part_Time", "Self_Employed", "Unemployed"],
+    "Acquisition_Channel": ["Corporate_Partner", "Direct_Website", "Local_Broker", "Affiliate_Group"],
+    "Payment_Schedule": ["Annual_Upfront", "Quarterly_Invoice"],
+    "Employment_Status": ["Self_Employed", "Contractor", "Unemployed"],
 }
+
+# Module-level cache for preprocessing artifacts
+_PREP_CACHE = None
+
+
+def _load_prep_artifacts():
+    """Load preprocessing artifacts from model.pkl (cached)."""
+    global _PREP_CACHE
+    if _PREP_CACHE is None:
+        try:
+            bundle = joblib.load("model.pkl")
+            _PREP_CACHE = bundle.get("prep", {})
+        except Exception:
+            _PREP_CACHE = {}
+    return _PREP_CACHE
 
 
 # ═══════════════════════════════════════════════════════════
@@ -38,55 +55,83 @@ OHE_SPECS = {
 # ═══════════════════════════════════════════════════════════
 def preprocess(df):
     df = df.copy()
+    is_train = "Purchased_Coverage_Bundle" in df.columns
 
+    # Load saved artifacts for test-time consistency
+    art = {} if is_train else _load_prep_artifacts()
+
+    # --- Identifiers ---
     df["Has_Employer_ID"] = df["Employer_ID"].notna().astype(int)
     df.drop(columns=["Employer_ID"], inplace=True)
 
+    # --- Missing values ---
     df["Has_Broker_ID"] = df["Broker_ID"].notna().astype(int)
     df["Broker_ID"] = df["Broker_ID"].fillna(-1).astype(int).astype(str)
-    df["Acquisition_Channel"] = df["Acquisition_Channel"].fillna(df["Acquisition_Channel"].mode()[0])
+    df["Acquisition_Channel"] = df["Acquisition_Channel"].fillna(art.get("acq_mode", df["Acquisition_Channel"].mode()[0]))
     df["Region_Code"] = df["Region_Code"].fillna("Unknown")
-    df["Deductible_Tier"] = df["Deductible_Tier"].fillna(df["Deductible_Tier"].mode()[0])
-    df["Child_Dependents"] = df["Child_Dependents"].fillna(df["Child_Dependents"].median()).astype(int)
+    df["Deductible_Tier"] = df["Deductible_Tier"].fillna(art.get("ded_mode", df["Deductible_Tier"].mode()[0]))
+    df["Child_Dependents"] = df["Child_Dependents"].fillna(art.get("child_med", df["Child_Dependents"].median())).astype(int)
 
+    # --- Outliers (use training caps at test time) ---
     df["Child_Dependents"] = df["Child_Dependents"].clip(upper=5)
-    income_cap = df["Estimated_Annual_Income"].quantile(0.99)
+
+    income_cap = art.get("income_cap", df["Estimated_Annual_Income"].quantile(0.99))
     df["Estimated_Annual_Income"] = df["Estimated_Annual_Income"].clip(upper=income_cap)
     df["Estimated_Annual_Income_Log"] = np.log1p(df["Estimated_Annual_Income"])
     df.drop(columns=["Estimated_Annual_Income"], inplace=True)
-    days_cap = df["Days_Since_Quote"].quantile(0.99)
+
+    days_cap = art.get("days_cap", df["Days_Since_Quote"].quantile(0.99))
     df["Days_Since_Quote"] = df["Days_Since_Quote"].clip(upper=days_cap)
     df["Underwriting_Processing_Days"] = np.log1p(df["Underwriting_Processing_Days"])
 
+    # --- Feature engineering ---
     df["Total_Dependents"] = df["Adult_Dependents"] + df["Child_Dependents"] + df["Infant_Dependents"]
+    df["Has_Dependents"] = (df["Total_Dependents"] > 0).astype(int)
+    df["Income_Per_Dependent"] = df["Estimated_Annual_Income_Log"] / (df["Total_Dependents"] + 1)
+    df["Claims_Ratio"] = df["Previous_Claims_Filed"] / (df["Years_Without_Claims"] + 1)
+    df["Policy_Activity"] = df["Policy_Amendments_Count"] + df["Custom_Riders_Requested"]
 
-    df["Month_Num"] = df["Policy_Start_Month"].map(MONTH_ORDER)
-    df["Month_Sin"] = np.sin(2 * np.pi * df["Month_Num"] / 12)
-    df["Month_Cos"] = np.cos(2 * np.pi * df["Month_Num"] / 12)
-    df.drop(columns=["Policy_Start_Month", "Month_Num"], inplace=True)
+    # Cyclical: Month
+    mn = df["Policy_Start_Month"].map(MONTH_MAP)
+    df["Month_Sin"] = np.sin(2 * np.pi * mn / 12)
+    df["Month_Cos"] = np.cos(2 * np.pi * mn / 12)
+    df.drop(columns=["Policy_Start_Month"], inplace=True)
+
+    # Cyclical: Day
     df["Day_Sin"] = np.sin(2 * np.pi * df["Policy_Start_Day"] / 31)
     df["Day_Cos"] = np.cos(2 * np.pi * df["Policy_Start_Day"] / 31)
     df.drop(columns=["Policy_Start_Day"], inplace=True)
+
+    # Cyclical: Week
     df["Week_Sin"] = np.sin(2 * np.pi * df["Policy_Start_Week"] / 52)
     df["Week_Cos"] = np.cos(2 * np.pi * df["Policy_Start_Week"] / 52)
     df.drop(columns=["Policy_Start_Week"], inplace=True)
 
-    df["Deductible_Tier"] = df["Deductible_Tier"].map(DEDUCTIBLE_ORDER)
+    # --- Encode categoricals ---
+    df["Deductible_Tier"] = df["Deductible_Tier"].map(DEDUCTIBLE_MAP)
     df["Is_National_Corporate"] = (df["Broker_Agency_Type"] == "National_Corporate").astype(int)
     df.drop(columns=["Broker_Agency_Type"], inplace=True)
 
+    # Manual one-hot (correct category names, train=test alignment)
     for col, cats in OHE_SPECS.items():
         for cat in cats:
             df[f"{col}_{cat}"] = (df[col] == cat).astype(int)
         df.drop(columns=[col], inplace=True)
 
-    region_freq = df["Region_Code"].value_counts(normalize=True)
-    df["Region_Code_Freq"] = df["Region_Code"].map(region_freq).fillna(0.0)
-    df.drop(columns=["Region_Code"], inplace=True)
+    # Frequency encoding: use training frequencies at test time
+    if "region_freq" in art:
+        df["Region_Code_Freq"] = df["Region_Code"].map(art["region_freq"]).fillna(0.0)
+    else:
+        rf = df["Region_Code"].value_counts(normalize=True)
+        df["Region_Code_Freq"] = df["Region_Code"].map(rf).fillna(0.0)
 
-    broker_freq = df["Broker_ID"].value_counts(normalize=True)
-    df["Broker_ID_Freq"] = df["Broker_ID"].map(broker_freq).fillna(0.0)
-    df.drop(columns=["Broker_ID"], inplace=True)
+    if "broker_freq" in art:
+        df["Broker_ID_Freq"] = df["Broker_ID"].map(art["broker_freq"]).fillna(0.0)
+    else:
+        bf = df["Broker_ID"].value_counts(normalize=True)
+        df["Broker_ID_Freq"] = df["Broker_ID"].map(bf).fillna(0.0)
+
+    df.drop(columns=["Region_Code", "Broker_ID"], inplace=True)
 
     return df
 
@@ -103,25 +148,25 @@ def load_model():
 #                         and Purchased_Coverage_Bundle
 # ═══════════════════════════════════════════════════════════
 def predict(df, model):
-    xgb_model = model["model"]
-    feature_cols = model["feature_columns"]
+    xgb = model["model"]
+    feat_cols = model["feature_columns"]
 
-    user_ids = df["User_ID"].reset_index(drop=True)
+    uids = df["User_ID"].values
 
+    # Build aligned feature matrix as numpy (fastest)
     features = df.drop(columns=["User_ID"], errors="ignore")
-    for col in ["Purchased_Coverage_Bundle", "Policy_Cancelled_Post_Purchase"]:
-        if col in features.columns:
-            features = features.drop(columns=[col])
+    for c in ["Purchased_Coverage_Bundle", "Policy_Cancelled_Post_Purchase"]:
+        if c in features.columns:
+            features = features.drop(columns=[c])
+    for c in feat_cols:
+        if c not in features.columns:
+            features[c] = 0
+    X = features[feat_cols].values.astype(np.float32)
 
-    for col in feature_cols:
-        if col not in features.columns:
-            features[col] = 0
-    features = features[feature_cols]
-
-    preds = xgb_model.predict(features)
+    preds = xgb.predict(X)
 
     return pd.DataFrame({
-        "User_ID": user_ids,
+        "User_ID": uids,
         "Purchased_Coverage_Bundle": preds.astype(int),
     })
 
@@ -130,35 +175,97 @@ def predict(df, model):
 #  Training  (only runs when executed directly)
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    import os, time
+    import time
+    from collections import Counter
     from sklearn.model_selection import StratifiedKFold, cross_validate
     from xgboost import XGBClassifier
 
     raw = pd.read_csv("train.csv")
-    df = preprocess(raw)
+    print(f"Loaded: {raw.shape}")
 
+    # Compute preprocessing artifacts from training data
+    prep_artifacts = {
+        "acq_mode": raw["Acquisition_Channel"].mode()[0],
+        "ded_mode": raw["Deductible_Tier"].mode()[0],
+        "child_med": float(raw["Child_Dependents"].median()),
+        "income_cap": float(raw["Estimated_Annual_Income"].quantile(0.99)),
+        "days_cap": float(raw["Days_Since_Quote"].quantile(0.99)),
+        "region_freq": raw["Region_Code"].fillna("Unknown").value_counts(normalize=True).to_dict(),
+        "broker_freq": raw["Broker_ID"].fillna(-1).astype(int).astype(str).value_counts(normalize=True).to_dict(),
+    }
+
+    df = preprocess(raw)
+    print(f"Preprocessed: {df.shape}")
+
+    # Prepare X, y
     y = df["Purchased_Coverage_Bundle"].map(LABEL_TO_INT)
     drop = [c for c in ["User_ID", "Purchased_Coverage_Bundle", "Policy_Cancelled_Post_Purchase"] if c in df.columns]
     X = df.drop(columns=drop)
-    feature_columns = list(X.columns)
+    feat_cols = list(X.columns)
+    print(f"Features: {len(feat_cols)}, Classes: {y.nunique()}")
 
+    # Class weights (balanced) for Macro F1 optimization
+    counts = Counter(y)
+    n = len(y)
+    n_cls = len(counts)
+    class_weights = {c: n / (n_cls * cnt) for c, cnt in counts.items()}
+    sample_weights = np.array([class_weights[yi] for yi in y])
+    print(f"Class weights: { {c: round(w, 1) for c, w in sorted(class_weights.items())} }")
+
+    # XGBoost with tuned parameters
     clf = XGBClassifier(
-        n_estimators=300, max_depth=6, learning_rate=0.1,
-        subsample=0.8, colsample_bytree=0.8,
-        eval_metric="mlogloss", random_state=42, verbosity=0, n_jobs=-1,
+        n_estimators=400,
+        max_depth=7,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        gamma=0.1,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        eval_metric="mlogloss",
+        random_state=42,
+        verbosity=0,
+        n_jobs=-1,
     )
 
+    # Cross-validate (without sample weights for honest F1 estimate)
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_res = cross_validate(clf, X, y, cv=cv, scoring=["accuracy", "f1_macro"], n_jobs=-1)
-    print(f"CV Accuracy: {cv_res['test_accuracy'].mean():.4f}")
-    print(f"CV F1 Macro: {cv_res['test_f1_macro'].mean():.4f}")
+    cv_res = cross_validate(clf, X, y, cv=cv, scoring=["f1_macro"], n_jobs=-1,
+                            fit_params={"sample_weight": sample_weights})
+    print(f"\nCV F1 Macro (weighted): {cv_res['test_f1_macro'].mean():.4f}")
 
-    clf.fit(X, y)
-    joblib.dump({"model": clf, "feature_columns": feature_columns}, "model.pkl", compress=3)
-    print(f"model.pkl saved ({os.path.getsize('model.pkl') / 1024 / 1024:.2f} MB)")
+    # Train final model on full data with sample weights
+    clf.fit(X, y, sample_weight=sample_weights)
 
-    test_df = preprocess(pd.read_csv("test.csv"))
-    sub = predict(test_df, load_model())
+    bundle = {
+        "model": clf,
+        "feature_columns": feat_cols,
+        "prep": prep_artifacts,
+    }
+    joblib.dump(bundle, "model.pkl", compress=3)
+    size_mb = os.path.getsize("model.pkl") / (1024 * 1024)
+    print(f"model.pkl: {size_mb:.2f} MB")
+
+    # Test inference
+    _PREP_CACHE = None  # reset cache
+    raw_test = pd.read_csv("test.csv")
+
+    # Set artifacts so preprocess uses training stats
+    _PREP_CACHE = prep_artifacts
+    test_df = preprocess(raw_test)
+    loaded = load_model()
+
+    t0 = time.time()
+    sub = predict(test_df, loaded)
+    lat = time.time() - t0
+
     sub.to_csv("submission.csv", index=False)
-    print(f"submission.csv saved ({len(sub)} rows)")
-    print(sub.head())
+    print(f"\nsubmission.csv: {len(sub)} rows")
+    print(f"Predictions:\n{sub['Purchased_Coverage_Bundle'].value_counts().sort_index()}")
+
+    sp = max(0.5, 1 - size_mb / 200)
+    lp = max(0.5, 1 - lat / 10)
+    f1 = cv_res['test_f1_macro'].mean()
+    print(f"\nF1={f1:.4f}  Size={size_mb:.2f}MB  Latency={lat:.3f}s")
+    print(f"Estimated Score: {f1 * sp * lp:.4f}")
